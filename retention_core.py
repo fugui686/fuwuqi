@@ -23,7 +23,7 @@ REGISTER_FILE = "register.csv"
 VISIT_FILE = "daily_visit.csv"
 LOGIN_FILE = "daily_login.csv"
 
-MONTH_DIR_FMT_LEN = 7  # YYYY-MM
+MONTH_DIR_FMT_LEN = 7
 
 
 def is_frozen():
@@ -103,6 +103,21 @@ def save_ini_defaults(updates):
     with open(p_save, "w", encoding="utf-8") as f:
         cp.write(f)
     return p_save
+
+
+def _load_default_config_map():
+    p = resolve_config_path_for_load()
+    cp = configparser.ConfigParser()
+    if os.path.exists(p):
+        cp.read(p, encoding="utf-8")
+    d = cp["DEFAULT"] if "DEFAULT" in cp else {}
+    mp = {}
+    try:
+        for k in d:
+            mp[str(k)] = (d.get(k, "") or "").strip()
+    except Exception:
+        pass
+    return mp
 
 
 def ensure_alias_map_file():
@@ -287,6 +302,11 @@ class GlobalConfig(object):
         admin_ids="",
         last_finalize_date="",
         access_token="",
+        enabled_keywords="金额区间",
+        enabled_keywords_default="金额区间",
+        ratio_enabled="0",
+        ratio_threshold="100",
+        ratio_percent="100",
     ):
         self.平台ID = (平台ID or "").strip()
         self.ht = self.normalize_ht(ht)
@@ -297,6 +317,11 @@ class GlobalConfig(object):
         self.admin_ids = (admin_ids or "").strip()
         self.last_finalize_date = (last_finalize_date or "").strip()
         self.access_token = (access_token or "").strip()
+        self.enabled_keywords = (enabled_keywords or "金额区间").strip()
+        self.enabled_keywords_default = (enabled_keywords_default or self.enabled_keywords or "金额区间").strip()
+        self.ratio_enabled = (ratio_enabled or "0").strip()
+        self.ratio_threshold = (ratio_threshold or "100").strip()
+        self.ratio_percent = (ratio_percent or "100").strip()
 
     @staticmethod
     def normalize_ht(ht):
@@ -362,6 +387,9 @@ def load_global_config_from_ini():
         except Exception:
             return default
 
+    enabled_keywords_raw = _get("enabled_keywords", "")
+    enabled_keywords_default_raw = _get("enabled_keywords_default", enabled_keywords_raw or "金额区间")
+
     cfg = GlobalConfig(
         平台ID=_get("platform_id", ""),
         ht=_get("ht", ""),
@@ -372,13 +400,23 @@ def load_global_config_from_ini():
         admin_ids=_get("admin_ids", ""),
         last_finalize_date=_get("last_finalize_date", ""),
         access_token=_get("access_token", ""),
+        enabled_keywords=enabled_keywords_raw or enabled_keywords_default_raw or "金额区间",
+        enabled_keywords_default=enabled_keywords_default_raw or "金额区间",
+        ratio_enabled=_get("ratio_enabled", "0"),
+        ratio_threshold=_get("ratio_threshold", "100"),
+        ratio_percent=_get("ratio_percent", "100"),
     )
+    
+    # 动态加载所有 channel_ratio_ 开头的配置
+    for key in d:
+        if key.startswith("channel_ratio_"):
+            setattr(cfg, key, d.get(key, ""))
+
     if os.path.exists(p):
         log("已加载配置：%s" % p)
     return cfg
 
 
-# ✅ 关键对齐：永远带 Cookie + Bearer
 def get_headers(平台ID, 子平台ID, ht, token, access_token=None):
     if not ht or not 平台ID:
         raise RuntimeError("配置缺失：请先填写 ht、platform_id")
@@ -467,7 +505,6 @@ def _extract_list(js):
     return []
 
 
-# -------- Fetch: 首存（旧版接口路径）--------
 def fetch_first_deposit_for_day(cfg, d):
     start_ts, end_ts = day_ts_range(d)
     url = "https://%s/api/go-gateway-internal/user/advancedGetUserListV2" % cfg.ht
@@ -518,7 +555,6 @@ def fetch_first_deposit_for_day(cfg, d):
     return all_rows
 
 
-# -------- Fetch: 注册（旧版接口路径）--------
 def fetch_register_for_day(cfg, d):
     start_ts, end_ts = day_ts_range(d)
     url = "https://%s/api/go-gateway-internal/user/advancedGetUserListV2" % cfg.ht
@@ -707,7 +743,6 @@ def fetch_visit_for_day(cfg, d):
     return rows
 
 
-# -------------------- Save month CSVs --------------------
 def save_first_deposit_month(cfg, month_key, new_rows):
     if not new_rows:
         return
@@ -948,7 +983,6 @@ def cleanup_all_sites(global_cfg, alias_map, months_to_keep):
     return "清理完成：最早保留月份 %s，共删除 %d 个月份目录" % (cutoff_m, total_deleted)
 
 
-# ===== 统计（保持你现有逻辑）=====
 def calc_visit_register_first(scope_sites, target_date, channel_filter=None):
     chf = norm(channel_filter) if channel_filter else None
     mkey = month_of_date_str(target_date)
@@ -993,6 +1027,129 @@ def format_reply_convert(title, date_str, total_visits, total_reg, total_first):
     )
 
 
+def _split_csv_tokens(raw):
+    s = (raw or "").strip()
+    if not s:
+        return []
+    return [x.strip() for x in re.split(r"[，,\s]+", s) if x.strip()]
+
+
+def get_enabled_keywords_from_cfg(cfg=None):
+    raw = ""
+    if cfg is not None:
+        raw = getattr(cfg, "enabled_keywords_default", "") or getattr(cfg, "enabled_keywords", "") or ""
+    items = _split_csv_tokens(raw)
+    if not items:
+        return ["金额区间"]
+    return items
+
+
+def get_enabled_keywords_for_chat(chat_id, cfg=None):
+    chat_id_str = str(chat_id or "").strip()
+    raw_map = _load_default_config_map()
+
+    raw = ""
+    if chat_id_str:
+        raw = (raw_map.get("enabled_keywords_chat_%s" % chat_id_str, "") or "").strip()
+
+    if not raw and cfg is not None:
+        raw = (getattr(cfg, "enabled_keywords_default", "") or getattr(cfg, "enabled_keywords", "") or "").strip()
+
+    if not raw:
+        raw = (raw_map.get("enabled_keywords_default", "") or raw_map.get("enabled_keywords", "") or "").strip()
+
+    items = _split_csv_tokens(raw)
+    if not items:
+        return ["金额区间"]
+    return items
+
+
+def get_ratio_rule_from_cfg(cfg=None, channel=None):
+    if cfg is None:
+        cfg = load_global_config_from_ini()
+    
+    if channel:
+        channel_key = channel.strip().lower()
+        channel_config_key = f"channel_ratio_{channel_key}"
+        channel_config = getattr(cfg, channel_config_key, "")
+        
+        if channel_config:
+            parts = str(channel_config).split(',')
+            if len(parts) == 3:
+                enabled = parts[0].strip() in ("1", "true", "yes", "on", "开启", "启用")
+                threshold = safe_float(parts[1])
+                percent = safe_float(parts[2])
+                
+                # 如果是整数，就转成整数，避免浮点数比较问题
+                if threshold == int(threshold):
+                    threshold = int(threshold)
+                if percent == int(percent):
+                    percent = int(percent)
+                
+                if threshold < 0:
+                    threshold = 0.0
+                if percent < 0:
+                    percent = 0.0
+                if percent > 100:
+                    percent = 100.0
+                
+                return {
+                    "enabled": enabled,
+                    "threshold": threshold,
+                    "percent": percent,
+                }
+    
+    enabled_raw = str(getattr(cfg, "ratio_enabled", "0") or "0").strip().lower()
+    enabled = enabled_raw in ("1", "true", "yes", "on", "开启", "启用")
+    threshold = safe_float(getattr(cfg, "ratio_threshold", "100") or 100)
+    percent = safe_float(getattr(cfg, "ratio_percent", "100") or 100)
+    
+    if threshold < 0:
+        threshold = 0.0
+    if percent < 0:
+        percent = 0.0
+    if percent > 100:
+        percent = 100.0
+    
+    return {
+        "enabled": enabled,
+        "threshold": threshold,
+        "percent": percent,
+    }
+
+    enabled_raw = str(getattr(cfg, "ratio_enabled", "0") or "0").strip().lower()
+    enabled = enabled_raw in ("1", "true", "yes", "on", "开启", "启用")
+    threshold = safe_float(getattr(cfg, "ratio_threshold", "100") or 100)
+    percent = safe_float(getattr(cfg, "ratio_percent", "100") or 100)
+
+    if threshold < 0:
+        threshold = 0.0
+    if percent < 0:
+        percent = 0.0
+    if percent > 100:
+        percent = 100.0
+
+    return {
+        "enabled": enabled,
+        "threshold": threshold,
+        "percent": percent,
+    }
+
+
+def _stable_sort_key_for_ratio(site_alias, user_id, first_date, amount, channel, threshold):
+    import hashlib
+
+    base = "%s|%s|%s|%s|%s|%s|v1" % (
+        (site_alias or "").strip().upper(),
+        (first_date or "").strip(),
+        (user_id or "").strip(),
+        (channel or "").strip().lower(),
+        ("%.2f" % float(amount or 0)).strip(),
+        ("%.2f" % float(threshold or 0)).strip(),
+    )
+    return hashlib.md5(base.encode("utf-8")).hexdigest()
+
+
 def calc_amount_ranges(scope_sites, first_date, channel_filter=None):
     chf = norm(channel_filter) if channel_filter else None
     mkey = month_of_date_str(first_date)
@@ -1005,7 +1162,14 @@ def calc_amount_ranges(scope_sites, first_date, channel_filter=None):
         ("100元以上", 100.0, float("inf")),
     ]
 
-    amounts = {}
+    ratio_rule = get_ratio_rule_from_cfg(channel=channel_filter)
+    ratio_enabled = bool(ratio_rule.get("enabled"))
+    ratio_threshold = safe_float(ratio_rule.get("threshold", 100))
+    ratio_percent = safe_float(ratio_rule.get("percent", 100))
+
+    fixed_rows = []
+    eligible_rows = []
+
     for s in scope_sites:
         for r in read_csv(s.month_first_csv(mkey)):
             if (r.get("first_date") or "") != first_date:
@@ -1018,7 +1182,44 @@ def calc_amount_ranges(scope_sites, first_date, channel_filter=None):
             amt = safe_float(r.get("first_amount", 0))
             if amt <= 0:
                 continue
-            amounts[unique_user_key(s.alias, uid)] = amt
+
+            row = {
+                "key": unique_user_key(s.alias, uid),
+                "site_alias": s.alias,
+                "user_id": uid,
+                "first_date": first_date,
+                "channel": (r.get("channel") or "").strip(),
+                "amount": amt,
+            }
+
+            if ratio_enabled and amt >= ratio_threshold:
+                eligible_rows.append(row)
+            else:
+                fixed_rows.append(row)
+
+    if ratio_enabled:
+        eligible_rows.sort(
+            key=lambda x: _stable_sort_key_for_ratio(
+                x.get("site_alias", ""),
+                x.get("user_id", ""),
+                x.get("first_date", ""),
+                x.get("amount", 0),
+                x.get("channel", ""),
+                ratio_threshold,
+            )
+        )
+        keep_count = int(round(len(eligible_rows) * ratio_percent / 100.0))
+        if keep_count < 0:
+            keep_count = 0
+        if keep_count > len(eligible_rows):
+            keep_count = len(eligible_rows)
+        kept_eligible_rows = eligible_rows[:keep_count]
+    else:
+        kept_eligible_rows = eligible_rows
+
+    amounts = {}
+    for row in (fixed_rows + kept_eligible_rows):
+        amounts[row["key"]] = row["amount"]
 
     total_users = len(amounts)
     total_amount = sum(amounts.values())
@@ -1069,7 +1270,6 @@ def _earliest_date_in_scope_all_months(scope_sites, channel_filter=None):
 
     for s in scope_sites:
         for m in list_site_month_dirs(s.alias):
-            # 首存日期（带 channel）
             for r in read_csv(s.month_first_csv(m)):
                 ds = (r.get("first_date") or "").strip()
                 if len(ds) != 10:
@@ -1080,27 +1280,21 @@ def _earliest_date_in_scope_all_months(scope_sites, channel_filter=None):
 
     return min(dates) if dates else ""
 
+
 def _build_user_channel_map(scope_sites, month_list):
-    """
-    建立 user_id -> channel 的映射（用于渠道汇总时过滤充值/提现）
-    优先用 register.csv 的 channel，其次用 first_deposit.csv 的 channel
-    """
     user2ch = {}
 
     for s in scope_sites:
         for m in month_list:
-            # register：更可靠
             for r in read_csv(s.month_register_csv(m)):
                 uid = (r.get("user_id") or "").strip()
                 ch = (r.get("channel") or "").strip()
                 if not uid or not ch:
                     continue
-                # 用首次出现的渠道，避免后面覆盖
                 key = unique_user_key(s.alias, uid)
                 if key not in user2ch:
                     user2ch[key] = ch
 
-            # first：补漏
             for r in read_csv(s.month_first_csv(m)):
                 uid = (r.get("user_id") or "").strip()
                 ch = (r.get("channel") or "").strip()
@@ -1112,18 +1306,10 @@ def _build_user_channel_map(scope_sites, month_list):
 
     return user2ch
 
+
 def compute_summary(scope_sites, target_date=None, channel_filter=None):
-    """
-    汇总口径说明：
-    - 访问量/注册/首存：按 target_date（如果传）过滤；且按 channel_filter（如果传）过滤
-    - 充值/提现/盈亏/客单价：
-        * 如果是 “渠道 + 日期” 查询（target_date 非空 且 channel_filter 非空）
-          -> 只统计“当日首存会员(first_date=当天)”的充值/提现
-        * 其它情况（全站/全时间/只日期无渠道等）保持原逻辑：统计符合条件的全量用户充值/提现
-    """
     chf = norm(channel_filter) if channel_filter else None
 
-    # 开始首存时间：按渠道过滤后的最早首存日期（用于展示）
     start_date = _earliest_date_in_scope_all_months(scope_sites, channel_filter=channel_filter) or (target_date or "")
 
     total_visits = 0
@@ -1133,7 +1319,6 @@ def compute_summary(scope_sites, target_date=None, channel_filter=None):
     total_recharge = 0.0
     total_withdraw = 0.0
 
-    # 如果指定日期，就只查当月；否则查所有月
     if target_date:
         month_list_global = [month_of_date_str(target_date)]
     else:
@@ -1142,17 +1327,13 @@ def compute_summary(scope_sites, target_date=None, channel_filter=None):
             month_list_global.extend(list_site_month_dirs(s.alias))
         month_list_global = sorted(set(month_list_global))
 
-    # ✅ 为“充值/提现”构建 user_id -> channel 映射（因为 daily_recharge.csv 没有 channel）
     user2ch = _build_user_channel_map(scope_sites, month_list_global)
 
-    # ✅ 关键口径：渠道 + 日期 -> 仅统计当日首存 cohort 的充值/提现
     only_first_cohort = (target_date is not None) and (channel_filter is not None)
 
-    # ========= 第1遍：统计访问/注册/首存，并构建 first_users（当日首存用户集合）=========
     for s in scope_sites:
         month_list = [month_of_date_str(target_date)] if target_date else list_site_month_dirs(s.alias)
 
-        # 访问量：visit.csv 本身有 channel，可直接过滤
         for m in month_list:
             for r in read_csv(s.month_visit_csv(m)):
                 ds = (r.get("visit_date") or "").strip()
@@ -1162,7 +1343,6 @@ def compute_summary(scope_sites, target_date=None, channel_filter=None):
                     continue
                 total_visits += safe_int(r.get("visit_count", 0))
 
-        # 注册：register.csv 有 channel，可直接过滤 + 记录用户集合
         for m in month_list:
             for r in read_csv(s.month_register_csv(m)):
                 ds = (r.get("reg_date") or "").strip()
@@ -1174,7 +1354,6 @@ def compute_summary(scope_sites, target_date=None, channel_filter=None):
                 if uid:
                     reg_users.add(unique_user_key(s.alias, uid))
 
-        # 首存：first_deposit.csv 有 channel，可直接过滤 + 首存金额（按“人”去重）
         for m in month_list:
             for r in read_csv(s.month_first_csv(m)):
                 ds = (r.get("first_date") or "").strip()
@@ -1189,7 +1368,6 @@ def compute_summary(scope_sites, target_date=None, channel_filter=None):
                         first_users.add(k)
                         first_amount_total += safe_float(r.get("first_amount", 0))
 
-    # ========= 第2遍：统计充值/提现（按口径过滤）=========
     for s in scope_sites:
         month_list = [month_of_date_str(target_date)] if target_date else list_site_month_dirs(s.alias)
 
@@ -1205,13 +1383,11 @@ def compute_summary(scope_sites, target_date=None, channel_filter=None):
 
                 k = unique_user_key(s.alias, uid)
 
-                # 渠道过滤：使用 user2ch 映射
                 if chf:
                     ch = user2ch.get(k)
                     if (not ch) or (norm(ch) != chf):
                         continue
 
-                # ✅ 只统计“当日首存 cohort”
                 if only_first_cohort:
                     if k not in first_users:
                         continue
@@ -1239,6 +1415,7 @@ def compute_summary(scope_sites, target_date=None, channel_filter=None):
         "recharge_per_first": recharge_per_first,
         "recharge_per_reg": recharge_per_reg,
     }
+
 
 def format_reply_summary(title, target_date, summary):
     head = title
